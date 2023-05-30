@@ -31,6 +31,7 @@ const (
 	DefaultCheckpointInterval = 1 * time.Minute
 	DefaultMinCheckpointPageN = 1000
 	DefaultMaxCheckpointPageN = 10000
+	DefaultTruncatePageN      = 500000
 )
 
 // MaxIndex is the maximum possible WAL index.
@@ -49,6 +50,7 @@ type DB struct {
 	rtx      *sql.Tx       // long running read transaction
 	pageSize int           // page size, in bytes
 	notify   chan struct{} // closes on WAL change
+	chkMu    sync.Mutex    // checkpoint lock
 
 	fileInfo os.FileInfo // db info cached during init
 	dirInfo  os.FileInfo // parent dir info cached during init
@@ -83,6 +85,16 @@ type DB struct {
 	// unbounded if there are always read transactions occurring.
 	MaxCheckpointPageN int
 
+	// Threshold of WAL size, in pages, before a forced truncation checkpoint.
+	// A forced truncation checkpoint will block new transactions and wait for
+	// existing transactions to finish before issuing a checkpoint and
+	// truncating the WAL.
+	//
+	// If zero, no truncates are forced. This can cause the WAL to grow
+	// unbounded if there's a sudden spike of changes between other
+	// checkpoints.
+	TruncatePageN int
+
 	// Time between automatic checkpoints in the WAL. This is done to allow
 	// more fine-grained WAL files so that restores can be performed with
 	// better precision.
@@ -107,6 +119,7 @@ func NewDB(path string) *DB {
 
 		MinCheckpointPageN: DefaultMinCheckpointPageN,
 		MaxCheckpointPageN: DefaultMaxCheckpointPageN,
+		TruncatePageN:      DefaultTruncatePageN,
 		CheckpointInterval: DefaultCheckpointInterval,
 		MonitorInterval:    DefaultMonitorInterval,
 
@@ -292,6 +305,9 @@ func (db *DB) Open() (err error) {
 		db.wg.Add(1)
 		go func() { defer db.wg.Done(); db.monitor() }()
 	}
+
+	// Try to initialize the database early, allow failing.
+	db.init()
 
 	return nil
 }
@@ -742,7 +758,7 @@ func (db *DB) Sync(ctx context.Context) (err error) {
 	}
 
 	// Synchronize real WAL with current shadow WAL.
-	newWALSize, err := db.syncWAL(info)
+	origWALSize, newWALSize, err := db.syncWAL(info)
 	if err != nil {
 		return fmt.Errorf("sync wal: %w", err)
 	}
@@ -751,7 +767,9 @@ func (db *DB) Sync(ctx context.Context) (err error) {
 	// If WAL size is greater than min threshold, attempt checkpoint.
 	var checkpoint bool
 	checkpointMode := CheckpointModePassive
-	if db.MaxCheckpointPageN > 0 && newWALSize >= calcWALSize(db.pageSize, db.MaxCheckpointPageN) {
+	if db.TruncatePageN > 0 && origWALSize >= calcWALSize(db.pageSize, db.TruncatePageN) {
+		checkpoint, checkpointMode = true, CheckpointModeTruncate
+	} else if db.MaxCheckpointPageN > 0 && newWALSize >= calcWALSize(db.pageSize, db.MaxCheckpointPageN) {
 		checkpoint, checkpointMode = true, CheckpointModeRestart
 	} else if newWALSize >= calcWALSize(db.pageSize, db.MinCheckpointPageN) {
 		checkpoint = true
@@ -910,29 +928,29 @@ type syncInfo struct {
 }
 
 // syncWAL copies pending bytes from the real WAL to the shadow WAL.
-func (db *DB) syncWAL(info syncInfo) (newSize int64, err error) {
+func (db *DB) syncWAL(info syncInfo) (origSize int64, newSize int64, err error) {
 	// Copy WAL starting from end of shadow WAL. Exit if no new shadow WAL needed.
-	newSize, err = db.copyToShadowWAL(info.shadowWALPath)
+	origSize, newSize, err = db.copyToShadowWAL(info.shadowWALPath)
 	if err != nil {
-		return newSize, fmt.Errorf("cannot copy to shadow wal: %w", err)
+		return origSize, newSize, fmt.Errorf("cannot copy to shadow wal: %w", err)
 	} else if !info.restart {
-		return newSize, nil // If no restart required, exit.
+		return origSize, newSize, nil // If no restart required, exit.
 	}
 
 	// Parse index of current shadow WAL file.
 	dir, base := filepath.Split(info.shadowWALPath)
 	index, err := ParseWALPath(base)
 	if err != nil {
-		return 0, fmt.Errorf("cannot parse shadow wal filename: %s", base)
+		return 0, 0, fmt.Errorf("cannot parse shadow wal filename: %s", base)
 	}
 
 	// Start a new shadow WAL file with next index.
 	newShadowWALPath := filepath.Join(dir, FormatWALPath(index+1))
 	newSize, err = db.initShadowWALFile(newShadowWALPath)
 	if err != nil {
-		return 0, fmt.Errorf("cannot init shadow wal file: name=%s err=%w", newShadowWALPath, err)
+		return 0, 0, fmt.Errorf("cannot init shadow wal file: name=%s err=%w", newShadowWALPath, err)
 	}
-	return newSize, nil
+	return origSize, newSize, nil
 }
 
 func (db *DB) initShadowWALFile(filename string) (int64, error) {
@@ -968,64 +986,79 @@ func (db *DB) initShadowWALFile(filename string) (int64, error) {
 	_ = os.Chown(filename, uid, gid)
 
 	// Copy as much shadow WAL as available.
-	newSize, err := db.copyToShadowWAL(filename)
+	_, newSize, err := db.copyToShadowWAL(filename)
 	if err != nil {
 		return 0, fmt.Errorf("cannot copy to new shadow wal: %w", err)
 	}
 	return newSize, nil
 }
 
-func (db *DB) copyToShadowWAL(filename string) (newSize int64, err error) {
+func (db *DB) copyToShadowWAL(filename string) (origWalSize int64, newSize int64, err error) {
 	Tracef("%s: copy-shadow: %s", db.path, filename)
 
 	r, err := os.Open(db.WALPath())
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	defer r.Close()
 
+	fi, err := r.Stat()
+	if err != nil {
+		return 0, 0, err
+	}
+	origWalSize = frameAlign(fi.Size(), db.pageSize)
+
 	w, err := os.OpenFile(filename, os.O_RDWR, 0666)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	defer w.Close()
 
-	fi, err := w.Stat()
+	fi, err = w.Stat()
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	origSize := frameAlign(fi.Size(), db.pageSize)
 
 	// Read shadow WAL header to determine byte order for checksum & salt.
 	hdr := make([]byte, WALHeaderSize)
 	if _, err := io.ReadFull(w, hdr); err != nil {
-		return 0, fmt.Errorf("read header: %w", err)
+		return 0, 0, fmt.Errorf("read header: %w", err)
 	}
 	hsalt0 := binary.BigEndian.Uint32(hdr[16:])
 	hsalt1 := binary.BigEndian.Uint32(hdr[20:])
 
 	bo, err := headerByteOrder(hdr)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 
 	// Read previous checksum.
 	chksum0, chksum1, err := readLastChecksumFrom(w, db.pageSize)
 	if err != nil {
-		return 0, fmt.Errorf("last checksum: %w", err)
+		return 0, 0, fmt.Errorf("last checksum: %w", err)
 	}
+
+	// Write to a temporary shadow file.
+	tempFilename := filename + ".tmp"
+	defer os.Remove(tempFilename)
+
+	f, err := internal.CreateFile(tempFilename, db.fileInfo)
+	if err != nil {
+		return 0, 0, fmt.Errorf("create temp file: %w", err)
+	}
+	defer f.Close()
 
 	// Seek to correct position on real wal.
 	if _, err := r.Seek(origSize, io.SeekStart); err != nil {
-		return 0, fmt.Errorf("real wal seek: %w", err)
+		return 0, 0, fmt.Errorf("real wal seek: %w", err)
 	} else if _, err := w.Seek(origSize, io.SeekStart); err != nil {
-		return 0, fmt.Errorf("shadow wal seek: %w", err)
+		return 0, 0, fmt.Errorf("shadow wal seek: %w", err)
 	}
 
 	// Read through WAL from last position to find the page of the last
 	// committed transaction.
 	frame := make([]byte, db.pageSize+WALFrameHeaderSize)
-	var buf bytes.Buffer
 	offset := origSize
 	lastCommitSize := origSize
 	for {
@@ -1034,7 +1067,7 @@ func (db *DB) copyToShadowWAL(filename string) (newSize int64, err error) {
 			Tracef("%s: copy-shadow: break %s @ %d; err=%s", db.path, filename, offset, err)
 			break // end of file or partial page
 		} else if err != nil {
-			return 0, fmt.Errorf("read wal: %w", err)
+			return 0, 0, fmt.Errorf("read wal: %w", err)
 		}
 
 		// Read frame salt & compare to header salt. Stop reading on mismatch.
@@ -1055,34 +1088,56 @@ func (db *DB) copyToShadowWAL(filename string) (newSize int64, err error) {
 			break
 		}
 
-		// Add page to the new size of the shadow WAL.
-		buf.Write(frame)
+		// Write page to temporary WAL file.
+		if _, err := f.Write(frame); err != nil {
+			return 0, 0, fmt.Errorf("write temp shadow wal: %w", err)
+		}
 
 		Tracef("%s: copy-shadow: ok %s offset=%d salt=%x %x", db.path, filename, offset, salt0, salt1)
 		offset += int64(len(frame))
 
-		// Flush to shadow WAL if commit record.
+		// Update new size if written frame was a commit record.
 		newDBSize := binary.BigEndian.Uint32(frame[4:])
 		if newDBSize != 0 {
-			if _, err := buf.WriteTo(w); err != nil {
-				return 0, fmt.Errorf("write shadow wal: %w", err)
-			}
-			buf.Reset()
 			lastCommitSize = offset
 		}
 	}
 
-	// Sync & close.
+	// If no WAL writes found, exit.
+	if origSize == lastCommitSize {
+		return origWalSize, origSize, nil
+	}
+
+	walByteN := lastCommitSize - origSize
+
+	// Move to beginning of temporary file.
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return 0, 0, fmt.Errorf("temp file seek: %w", err)
+	}
+
+	// Copy from temporary file to shadow WAL.
+	if _, err := io.Copy(w, &io.LimitedReader{R: f, N: walByteN}); err != nil {
+		return 0, 0, fmt.Errorf("write shadow file: %w", err)
+	}
+
+	// Close & remove temporary file.
+	if err := f.Close(); err != nil {
+		return 0, 0, err
+	} else if err := os.Remove(tempFilename); err != nil {
+		return 0, 0, err
+	}
+
+	// Sync & close shadow WAL.
 	if err := w.Sync(); err != nil {
-		return 0, err
+		return 0, 0, err
 	} else if err := w.Close(); err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 
 	// Track total number of bytes written to WAL.
-	db.totalWALBytesCounter.Add(float64(lastCommitSize - origSize))
+	db.totalWALBytesCounter.Add(float64(walByteN))
 
-	return lastCommitSize, nil
+	return origWalSize, lastCommitSize, nil
 }
 
 // ShadowWALReader opens a reader for a shadow WAL file at a given position.
@@ -1239,6 +1294,12 @@ func (db *DB) Checkpoint(ctx context.Context, mode string) (err error) {
 // checkpointAndInit performs a checkpoint on the WAL file and initializes a
 // new shadow WAL file.
 func (db *DB) checkpoint(ctx context.Context, generation, mode string) error {
+	// Try getting a checkpoint lock, will fail during snapshots.
+	if !db.chkMu.TryLock() {
+		return nil
+	}
+	defer db.chkMu.Unlock()
+
 	shadowWALPath, err := db.CurrentShadowWALPath(generation)
 	if err != nil {
 		return err
@@ -1251,7 +1312,7 @@ func (db *DB) checkpoint(ctx context.Context, generation, mode string) error {
 	}
 
 	// Copy shadow WAL before checkpoint to copy as much as possible.
-	if _, err := db.copyToShadowWAL(shadowWALPath); err != nil {
+	if _, _, err := db.copyToShadowWAL(shadowWALPath); err != nil {
 		return fmt.Errorf("cannot copy to end of shadow wal before checkpoint: %w", err)
 	}
 
@@ -1286,7 +1347,7 @@ func (db *DB) checkpoint(ctx context.Context, generation, mode string) error {
 	}
 
 	// Copy the end of the previous WAL before starting a new shadow WAL.
-	if _, err := db.copyToShadowWAL(shadowWALPath); err != nil {
+	if _, _, err := db.copyToShadowWAL(shadowWALPath); err != nil {
 		return fmt.Errorf("cannot copy to end of shadow wal: %w", err)
 	}
 
@@ -1345,7 +1406,7 @@ func (db *DB) execCheckpoint(mode string) (err error) {
 	if err := db.db.QueryRow(rawsql).Scan(&row[0], &row[1], &row[2]); err != nil {
 		return err
 	}
-	Tracef("%s: checkpoint: mode=%v (%d,%d,%d)", db.path, mode, row[0], row[1], row[2])
+	log.Printf("%s: checkpoint: mode=%v (%d,%d,%d)", db.path, mode, row[0], row[1], row[2])
 
 	// Reacquire the read lock immediately after the checkpoint.
 	if err := db.acquireReadLock(); err != nil {
@@ -1472,6 +1533,19 @@ func (db *DB) CRC64(ctx context.Context) (uint64, Pos, error) {
 		return 0, pos, err
 	}
 	return h.Sum64(), pos, nil
+}
+
+// BeginSnapshot takes an internal snapshot lock preventing checkpoints.
+//
+// When calling this the caller must also call EndSnapshot() once the snapshot
+// is finished.
+func (db *DB) BeginSnapshot() {
+	db.chkMu.Lock()
+}
+
+// EndSnapshot releases the internal snapshot lock that prevents checkpoints.
+func (db *DB) EndSnapshot() {
+	db.chkMu.Unlock()
 }
 
 // DefaultRestoreParallelism is the default parallelism when downloading WAL files.
