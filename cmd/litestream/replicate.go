@@ -10,6 +10,7 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"os/exec"
+	"time"
 
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/abs"
@@ -103,6 +104,25 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 		log.Println("no databases specified in configuration")
 	}
 
+	// Parse exec commands args & start subprocess.
+	if c.Config.Exec != "" {
+		execArgs, err := shellwords.Parse(c.Config.Exec)
+		if err != nil {
+			return fmt.Errorf("cannot parse exec command: %w", err)
+		}
+
+		c.cmd = exec.CommandContext(ctx, execArgs[0], execArgs[1:]...)
+		c.cmd.Env = os.Environ()
+		c.cmd.Stdout = os.Stdout
+		c.cmd.Stderr = os.Stderr
+		if err := c.cmd.Start(); err != nil {
+			return fmt.Errorf("cannot start exec command: %w", err)
+		}
+		go func() { c.execCh <- c.cmd.Wait() }()
+	}
+
+	time.Sleep(time.Second)
+
 	for _, dbConfig := range c.Config.DBs {
 		db, err := NewDBFromConfig(dbConfig)
 		if err != nil {
@@ -153,23 +173,6 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 				log.Printf("cannot start metrics server: %s", err)
 			}
 		}()
-	}
-
-	// Parse exec commands args & start subprocess.
-	if c.Config.Exec != "" {
-		execArgs, err := shellwords.Parse(c.Config.Exec)
-		if err != nil {
-			return fmt.Errorf("cannot parse exec command: %w", err)
-		}
-
-		c.cmd = exec.CommandContext(ctx, execArgs[0], execArgs[1:]...)
-		c.cmd.Env = os.Environ()
-		c.cmd.Stdout = os.Stdout
-		c.cmd.Stderr = os.Stderr
-		if err := c.cmd.Start(); err != nil {
-			return fmt.Errorf("cannot start exec command: %w", err)
-		}
-		go func() { c.execCh <- c.cmd.Wait() }()
 	}
 
 	return nil
